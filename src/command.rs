@@ -186,3 +186,9 @@ impl Command {
         }
     }
 }
+
+impl Default for Command {
+    fn default() -> Self {
+        Command::Custom(Borrowed(""))
+    }
+}

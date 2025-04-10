@@ -304,7 +304,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
 
             if self.lock.catch_signals {
                 // Ctrl-C is always intercepted (unless we're catching no signals).
-                // By default, linefeed handles it by clearing the current input state.
+                // By default, lineread handles it by clearing the current input state.
                 signals.insert(Signal::Interrupt);
             }
 
@@ -374,7 +374,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn add_history(&self, line: String) {
         if !self.lock.is_active() {
-            self.iface.lock_write().add_history(line);
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.add_history(line);
+            }
         }
     }
 
@@ -385,7 +387,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn add_history_unique(&self, line: String) {
         if !self.lock.is_active() {
-            self.iface.lock_write().add_history_unique(line);
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.add_history_unique(line);
+            }
         }
     }
 
@@ -396,7 +400,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn clear_history(&self) {
         if !self.lock.is_active() {
-            self.iface.lock_write().clear_history();
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.clear_history();
+            }
         }
     }
 
@@ -409,7 +415,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn remove_history(&self, idx: usize) {
         if !self.lock.is_active() {
-            self.iface.lock_write().remove_history(idx);
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.remove_history(idx);
+            }
         }
     }
 
@@ -423,7 +431,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn set_history_size(&self, n: usize) {
         if !self.lock.is_active() {
-            self.iface.lock_write().set_history_size(n);
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.set_history_size(n);
+            }
         }
     }
 
@@ -434,7 +444,9 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn truncate_history(&self, n: usize) {
         if !self.lock.is_active() {
-            self.iface.lock_write().truncate_history(n);
+            if let Ok(mut lock) = self.iface.lock_write() {
+                lock.truncate_history(n);
+            }
         }
     }
 
@@ -493,12 +505,12 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
         self.lock.blink_matching_paren = set;
     }
 
-    /// Returns whether `linefeed` will catch certain signals.
+    /// Returns whether `lineread` will catch certain signals.
     pub fn catch_signals(&self) -> bool {
         self.lock.catch_signals
     }
 
-    /// Sets whether `linefeed` will catch certain signals.
+    /// Sets whether `lineread` will catch certain signals.
     ///
     /// This setting is `true` by default. It can be disabled to allow the
     /// host program to handle signals itself.
@@ -721,7 +733,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     fn prompter<'b>(&'b mut self) -> Prompter<'b, 'a, Term> {
         Prompter::new(
             &mut self.lock,
-            self.iface.lock_write())
+            self.iface.lock_write().expect("Failed to acquire write lock"))
     }
 
     fn handle_resize(&mut self, size: Size) -> io::Result<()> {
@@ -1018,7 +1030,7 @@ impl<Term: Terminal> Read<Term> {
     fn eval_condition(&self, term: &Term, name: Option<&str>, value: &str) -> bool {
         match name {
             None => self.application == value,
-            Some("lib") => value == "linefeed",
+            Some("lib") => value == "lineread",
             Some("mode") => value == "emacs",
             Some("term") => self.term_matches(term, value),
             _ => false

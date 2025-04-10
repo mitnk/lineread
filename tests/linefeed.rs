@@ -1,4 +1,4 @@
-extern crate linefeed;
+extern crate lineread;
 
 #[macro_use] extern crate assert_matches;
 
@@ -6,9 +6,9 @@ use std::env::set_var;
 use std::io;
 use std::sync::Arc;
 
-use linefeed::{Command, Completer, Completion, Interface, Prompter, ReadResult};
-use linefeed::memory::MemoryTerminal;
-use linefeed::terminal::{Size, Terminal};
+use lineread::{Command, Completer, Completion, Interface, Prompter, ReadResult};
+use lineread::memory::MemoryTerminal;
+use lineread::terminal::{Size, Terminal};
 
 const UP_ARROW: &str = "\x1b[A";
 const DOWN_ARROW: &str = "\x1b[B";

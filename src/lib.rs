@@ -9,7 +9,7 @@
 //!
 //! ```no_run
 //! # use std::io;
-//! use linefeed::{Interface, ReadResult};
+//! use lineread::{Interface, ReadResult};
 //!
 //! # fn run() -> io::Result<()> {
 //! let mut reader = Interface::new("my-application")?;
@@ -46,11 +46,13 @@ pub mod complete;
 pub mod function;
 pub mod inputrc;
 pub mod interface;
+pub mod highlighting;
 pub mod memory;
 pub mod prompter;
 pub mod reader;
 pub mod table;
 pub mod terminal;
+
 mod util;
 pub mod variables;
 pub mod writer;

@@ -32,7 +32,6 @@ pub struct MemoryTerminal {
 #[derive(Debug)]
 struct Writer {
     memory: Vec<char>,
-    input: Vec<u8>,
     col: usize,
     line: usize,
     cursor_mode: CursorMode,
@@ -243,7 +242,6 @@ impl Writer {
 
         Writer{
             memory: vec![' '; n_chars],
-            input: Vec::new(),
             col: 0,
             line: 0,
             cursor_mode: CursorMode::Normal,

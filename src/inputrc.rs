@@ -43,7 +43,7 @@ pub fn parse_file<P: ?Sized>(filename: &P) -> Option<Vec<Directive>>
     let mut f = match File::open(filename) {
         Ok(f) => f,
         Err(e) => {
-            let _ = writeln!(stderr(), "linefeed: {}: {}", filename.display(), e);
+            let _ = writeln!(stderr(), "lineread: {}: {}", filename.display(), e);
             return None;
         }
     };
@@ -316,7 +316,7 @@ impl<'a> Parser<'a> {
 
     fn error(&self, msg: &str) {
         let _ = writeln!(stderr(),
-            "linefeed: {} line {}: {}", self.filename.display(), self.line_num, msg);
+            "lineread: {} line {}: {}", self.filename.display(), self.line_num, msg);
     }
 
     fn invalid(&self) {

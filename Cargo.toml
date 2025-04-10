@@ -1,14 +1,14 @@
 [package]
-name = "linefeed"
+name = "lineread"
 description = "Interactive terminal input reader"
 
-authors = ["Murarth <murarth@gmail.com>"]
-version = "0.6.0"
+authors = ["Murarth <murarth@gmail.com>", "Hugo Wang <w@mitnk.com>"]
+version = "0.7.0"
 edition = "2018"
 
-documentation = "https://docs.rs/linefeed/"
-homepage = "https://github.com/murarth/linefeed"
-repository = "https://github.com/murarth/linefeed"
+documentation = "https://docs.rs/lineread/"
+homepage = "https://github.com/mitnk/lineread"
+repository = "https://github.com/mitnk/lineread"
 
 categories = ["command-line-interface"]
 keywords = ["console", "terminal", "input", "readline"]

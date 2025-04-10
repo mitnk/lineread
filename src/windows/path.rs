@@ -12,5 +12,5 @@ pub fn system_init_file() -> Option<PathBuf> {
 }
 
 pub fn user_init_file() -> Option<PathBuf> {
-    data_dir().map(|p| p.join(r"linefeed\inputrc"))
+    data_dir().map(|p| p.join(r"lineread\inputrc"))
 }
