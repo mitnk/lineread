@@ -8,11 +8,12 @@ use std::str::{from_utf8, from_utf8_unchecked};
 pub fn filter_visible(s: &str) -> Cow<str> {
     use crate::reader::{START_INVISIBLE, END_INVISIBLE};
 
-    if !s.contains(START_INVISIBLE) {
+    // Quick return if no invisible markers are present
+    if !s.contains(START_INVISIBLE) && !s.contains(END_INVISIBLE) {
         return Cow::Borrowed(s);
     }
 
-    let mut virt = String::new();
+    let mut virt = String::with_capacity(s.len());
     let mut ignore = false;
 
     for ch in s.chars() {

@@ -3,7 +3,7 @@ name = "lineread"
 description = "Interactive terminal input reader"
 
 authors = ["Murarth <murarth@gmail.com>", "Hugo Wang <w@mitnk.com>"]
-version = "0.7.0"
+version = "0.7.1-beta"
 edition = "2018"
 
 documentation = "https://docs.rs/lineread/"

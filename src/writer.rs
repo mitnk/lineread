@@ -284,9 +284,18 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
             }
         }
 
+        // Draw buffer contents
         self.draw_buffer(0)?;
+
+        // Calculate the exact position where the cursor should be after drawing buffer
         let len = self.buffer.len();
-        self.move_from(len)
+
+        // Force a move to explicitly position the cursor at the end of input
+        // instead of letting the terminal guess where it should be
+        self.move_to(len)?;
+
+        // Return success
+        Ok(())
     }
 
     pub fn redraw_prompt(&mut self, new_prompt: PromptType) -> io::Result<()> {
@@ -346,10 +355,31 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
         let mut cur_col = start_col;
         let mut text_pos = 0; // Position within text
         let width = self.screen_size.columns;
+        let mut in_invisible_section = false;
 
         for chr in text.chars() {
             let char_start_text_pos = text_pos;
             text_pos += chr.len_utf8();
+
+            // Keep track of invisible sections (ANSI codes)
+            if handle_invisible {
+                if chr == START_INVISIBLE {
+                    in_invisible_section = true;
+                    self.term.write(chr.encode_utf8(&mut [0u8; 4]))?;
+                    continue;
+                } else if chr == END_INVISIBLE {
+                    in_invisible_section = false;
+                    self.term.write(chr.encode_utf8(&mut [0u8; 4]))?;
+                    continue;
+                }
+
+                // Don't advance cursor position for invisible characters
+                if in_invisible_section {
+                    let mut char_buf = [0u8; 4];
+                    self.term.write(chr.encode_utf8(&mut char_buf))?;
+                    continue;
+                }
+            }
 
             // Style lookup logic
             let mut next_style = Style::Default;
@@ -374,11 +404,7 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
 
             // Character drawing logic
             let mut char_buf = [0u8; 4];
-            if handle_invisible && chr == START_INVISIBLE {
-                 self.term.write(chr.encode_utf8(&mut char_buf))?;
-            } else if handle_invisible && chr == END_INVISIBLE {
-                 self.term.write(chr.encode_utf8(&mut char_buf))?;
-            } else if chr == '\t' && disp.allow_tab {
+            if chr == '\t' && disp.allow_tab {
                 let n = TAB_STOP - (cur_col % TAB_STOP);
                 let spaces = vec![b' '; n];
                 if cur_col + n > width {
@@ -1038,9 +1064,23 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
             return (0, 0);
         }
 
-        let n = start_col + self.display_size(&buf[..pos], start_col);
+        // First calculate the display size of the buffer content
+        let content_display_width = self.display_size(&buf[..pos], 0);
 
-        (n / width, n % width)
+        // Then calculate the total displayed columns including the prompt
+        let total_display_width = start_col + content_display_width;
+
+        if width > 0 {
+            // For exact line endings, ensure cursor goes to next line's beginning
+            if total_display_width > 0 && total_display_width % width == 0 {
+                (total_display_width / width, 0)
+            } else {
+                (total_display_width / width, total_display_width % width)
+            }
+        } else {
+            // Avoid division by zero
+            (0, total_display_width)
+        }
     }
 
     pub fn clear_screen(&mut self) -> io::Result<()> {
@@ -1082,6 +1122,10 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
 
     /// Move back to true cursor position from some other position
     pub fn move_from(&mut self, pos: usize) -> io::Result<()> {
+        if pos == self.cursor {
+            return Ok(());  // Already at the right position
+        }
+
         let (lines, cols) = self.move_delta(pos, self.cursor, &self.buffer);
         self.move_rel(lines, cols)
     }
@@ -1108,12 +1152,20 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
     /// Moves from `old` to `new` cursor position, using the given buffer
     /// as current input.
     fn move_delta(&self, old: usize, new: usize, buf: &str) -> (isize, isize) {
+        // Calculate the position for both old and new cursor positions
         let prompt_len = self.prompt_suffix_length();
+
+        // Get screen coordinates for the old cursor position
         let (old_line, old_col) = self.line_col_with(old, buf, prompt_len);
+
+        // Get screen coordinates for the new cursor position
         let (new_line, new_col) = self.line_col_with(new, buf, prompt_len);
 
-        (new_line as isize - old_line as isize,
-         new_col as isize - old_col as isize)
+        // Calculate the difference in lines and columns
+        let line_diff = new_line as isize - old_line as isize;
+        let col_diff = new_col as isize - old_col as isize;
+
+        (line_diff, col_diff)
     }
 
     fn move_rel(&mut self, lines: isize, cols: isize) -> io::Result<()> {
@@ -1320,42 +1372,75 @@ impl Write {
         self.prompt_prefix = pre.to_owned();
         self.prompt_suffix = suf.to_owned();
 
+        // Extract visible text by filtering out invisible sequences
         let pre_virt = filter_visible(pre);
+
+        // Calculate the correct display size of the filtered prompt prefix
         self.prompt_prefix_len = self.display_size(&pre_virt, 0);
 
+        // Extract visible text by filtering out invisible sequences
         let suf_virt = filter_visible(suf);
+
+        // Calculate the correct display size of the filtered prompt suffix
         self.prompt_suffix_len = self.display_size(&suf_virt, 0);
     }
 
     pub fn display_size(&self, s: &str, start_col: usize) -> usize {
         let width = self.screen_size.columns;
-        let mut col = start_col;
+        if width == 0 {
+            // Avoid division by zero and other issues with zero width
+            return s.chars().filter(|&ch| ch != START_INVISIBLE && ch != END_INVISIBLE).count();
+        }
 
+        let mut col = start_col;
+        let mut in_invisible_section = false;
+
+        // Use this display config for visual width calculation
         let disp = Display{
             allow_tab: true,
             allow_newline: true,
             .. Display::default()
         };
 
-        for ch in s.chars().flat_map(|ch| display(ch, disp)) {
-            let n = match ch {
-                '\n' => width - (col % width),
-                '\t' => TAB_STOP - (col % TAB_STOP),
-                ch if is_combining_mark(ch) => 0,
-                ch if is_wide(ch) => {
-                    if col % width == width - 1 {
-                        // Can't render a fullwidth character into last column
-                        3
-                    } else {
-                        2
-                    }
-                }
-                _ => 1
-            };
+        // Process each character in the string
+        for ch in s.chars() {
+            // Handle invisible section markers
+            if ch == START_INVISIBLE {
+                in_invisible_section = true;
+                continue;
+            } else if ch == END_INVISIBLE {
+                in_invisible_section = false;
+                continue;
+            }
 
-            col += n;
+            // Skip width calculation for characters inside invisible sections
+            if in_invisible_section {
+                continue;
+            }
+
+            // Process visible characters for width calculation
+            for display_ch in display(ch, disp) {
+                let n = match display_ch {
+                    '\n' => width - (col % width),
+                    '\t' => TAB_STOP - (col % TAB_STOP),
+                    ch if is_combining_mark(ch) => 0,
+                    ch if is_wide(ch) => {
+                        if col % width == width - 1 {
+                            // Can't render a fullwidth character into last column
+                            // When we reach the end of a line, it wraps to the next line
+                            3
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 1
+                };
+
+                col += n;
+            }
         }
 
+        // Return the calculated width
         col - start_col
     }
 }
