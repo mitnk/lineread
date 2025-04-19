@@ -47,9 +47,9 @@ use crate::writer::{Write, Writer, WriteLock};
 /// [`Prompter`]: ../prompter/struct.Prompter.html
 /// [`read_line`]: #method.read_line
 pub struct Interface<Term: Terminal> {
-    term: Arc<Term>,
-    read: Arc<Mutex<Read<Term>>>,
-    write: Arc<Mutex<Write>>,
+    term: Term,
+    write: Mutex<Write>,
+    read: Mutex<Read<Term>>,
     highlighter: Option<Arc<dyn Highlighter + Send + Sync>>,
 }
 
@@ -78,9 +78,9 @@ impl<Term: Terminal> Interface<Term> {
         let read = Read::new(&term, application.into());
 
         Ok(Interface{
-            term: Arc::new(term),
-            read: Arc::new(Mutex::new(read)),
-            write: Arc::new(Mutex::new(Write::new(size))),
+            term: term,
+            write: Mutex::new(Write::new(size)),
+            read: Mutex::new(read),
             highlighter: None,
         })
     }
@@ -104,7 +104,7 @@ impl<Term: Terminal> Interface<Term> {
     ///
     /// [`lock_writer_erase`]: #method.lock_writer_erase
     pub fn lock_writer_append(&self) -> io::Result<Writer<Term>> {
-        Writer::with_lock(self.lock_write()?, false)
+        Writer::with_lock(self.lock_write(), false)
     }
 
     /// Acquires the write lock and returns a `Writer` instance.
@@ -117,7 +117,7 @@ impl<Term: Terminal> Interface<Term> {
     ///
     /// [`lock_writer_append`]: #method.lock_writer_append
     pub fn lock_writer_erase(&self) -> io::Result<Writer<Term>> {
-        Writer::with_lock(self.lock_write()?, true)
+        Writer::with_lock(self.lock_write(), true)
     }
 
     fn lock_read(&self) -> ReadLock<Term> {
@@ -126,12 +126,12 @@ impl<Term: Terminal> Interface<Term> {
             self.read.lock().expect("Interface::lock_read"))
     }
 
-    pub(crate) fn lock_write(&self)
-            -> io::Result<WriteLock<Term>> {
-        let guard = self.write.lock().unwrap();
-        let term_writer = self.term.lock_write();
-
-        Ok(WriteLock::new(term_writer, guard, self.highlighter.clone()))
+    pub(crate) fn lock_write(&self) -> WriteLock<Term> {
+        WriteLock::new(
+            self.term.lock_write(),
+            self.write.lock().expect("Interface::lock_write"),
+            self.highlighter.clone(),
+        )
     }
 
     pub(crate) fn lock_write_data(&self) -> MutexGuard<Write> {
@@ -315,12 +315,12 @@ impl<Term: Terminal> Interface<Term> {
 impl<Term: Terminal> Interface<Term> {
     /// Returns the current input buffer.
     pub fn buffer(&self) -> String {
-        self.lock_write().map(|lock| lock.buffer.to_owned()).unwrap_or_default()
+        self.lock_write().buffer.to_owned()
     }
 
     /// Returns the current number of history entries.
     pub fn history_len(&self) -> usize {
-        self.lock_write().map(|lock| lock.history_len()).unwrap_or(0)
+        self.lock_write().history_len()
     }
 
     /// Returns the maximum number of history entries.
@@ -330,7 +330,7 @@ impl<Term: Terminal> Interface<Term> {
     ///
     /// [`history_len`]: #method.history_len
     pub fn history_size(&self) -> usize {
-        self.lock_write().map(|lock| lock.history_size()).unwrap_or(0)
+        self.lock_write().history_size()
     }
 
     /// Save history entries to the specified file.
@@ -345,7 +345,7 @@ impl<Term: Terminal> Interface<Term> {
     /// it is first truncated, discarding the oldest entries.
     pub fn save_history<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let path = path.as_ref();
-        let mut w = self.lock_write()?;
+        let mut w = self.lock_write();
 
         if !path.exists() || w.history_size() == !0 {
             self.append_history(path, &w)?;
@@ -416,7 +416,7 @@ impl<Term: Terminal> Interface<Term> {
 
     /// Load history entries from the specified file.
     pub fn load_history<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let mut writer = self.lock_write()?;
+        let mut writer = self.lock_write();
 
         let file = File::open(&path)?;
         let rdr = BufReader::new(file);

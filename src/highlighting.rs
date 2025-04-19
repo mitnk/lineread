@@ -16,3 +16,6 @@ pub trait Highlighter {
     /// Takes the current line buffer and returns a list of styled ranges.
     fn highlight(&self, line: &str) -> Vec<(Range<usize>, Style)>;
 }
+
+/// Style reset sequence
+pub const RESET_STYLE: &str = "\x1b[0m";

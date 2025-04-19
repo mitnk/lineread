@@ -13,7 +13,7 @@ use lineread::{Interface, ReadResult};
 fn main() -> io::Result<()> {
     let interface = Interface::new("color-demo")?;
 
-    let style = Color::Blue.bold();
+    let style = Color::Red.bold();
     let text = "color-demo> ";
 
     // The character values '\x01' and '\x02' are used to indicate the beginning

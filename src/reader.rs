@@ -374,9 +374,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn add_history(&self, line: String) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.add_history(line);
-            }
+            self.iface.lock_write().add_history(line);
         }
     }
 
@@ -387,9 +385,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn add_history_unique(&self, line: String) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.add_history_unique(line);
-            }
+            self.iface.lock_write().add_history_unique(line);
         }
     }
 
@@ -400,9 +396,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn clear_history(&self) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.clear_history();
-            }
+            self.iface.lock_write().clear_history();
         }
     }
 
@@ -415,9 +409,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn remove_history(&self, idx: usize) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.remove_history(idx);
-            }
+            self.iface.lock_write().remove_history(idx);
         }
     }
 
@@ -431,9 +423,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn set_history_size(&self, n: usize) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.set_history_size(n);
-            }
+            self.iface.lock_write().set_history_size(n);
         }
     }
 
@@ -444,9 +434,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     /// If a `read_line` call is in progress, this method has no effect.
     pub fn truncate_history(&self, n: usize) {
         if !self.lock.is_active() {
-            if let Ok(mut lock) = self.iface.lock_write() {
-                lock.truncate_history(n);
-            }
+            self.iface.lock_write().truncate_history(n);
         }
     }
 
@@ -733,7 +721,7 @@ impl<'a, Term: 'a + Terminal> Reader<'a, Term> {
     fn prompter<'b>(&'b mut self) -> Prompter<'b, 'a, Term> {
         Prompter::new(
             &mut self.lock,
-            self.iface.lock_write().expect("Failed to acquire write lock"))
+            self.iface.lock_write())
     }
 
     fn handle_resize(&mut self, size: Size) -> io::Result<()> {

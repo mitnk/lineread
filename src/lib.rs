@@ -44,15 +44,14 @@ pub mod chars;
 pub mod command;
 pub mod complete;
 pub mod function;
+pub mod highlighting;
 pub mod inputrc;
 pub mod interface;
-pub mod highlighting;
 pub mod memory;
 pub mod prompter;
 pub mod reader;
 pub mod table;
 pub mod terminal;
-
 mod util;
 pub mod variables;
 pub mod writer;

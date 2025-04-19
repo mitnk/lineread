@@ -6,16 +6,15 @@ use std::borrow::Cow::{self, Borrowed, Owned};
 use std::collections::{vec_deque, VecDeque};
 use std::fmt;
 use std::io;
-use std::iter::Skip;
+use std::iter::{repeat, Skip};
 use std::mem::swap;
 use std::ops::{Deref, DerefMut, Range};
+use std::sync::Arc;
 use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
-use std::sync::Arc;
-use std::str;
 
 use crate::chars::{is_ctrl, unctrl, ESCAPE, RUBOUT};
-use crate::highlighting::{Highlighter, Style};
+use crate::highlighting::{Highlighter, Style, RESET_STYLE};
 use crate::reader::{START_INVISIBLE, END_INVISIBLE};
 use crate::terminal::{CursorMode, Size, Terminal, TerminalWriter};
 use crate::util::{
@@ -69,6 +68,7 @@ enum WriterImpl<'a, 'b: 'a, Term: 'b + Terminal> {
     MutRef(&'a mut WriteLock<'b, Term>),
 }
 
+#[derive(Debug)]
 pub(crate) struct Write {
     /// Input buffer
     pub buffer: String,
@@ -220,19 +220,7 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
             PromptType::CompleteMore => Ok(()),
             _ => {
                 let pfx = self.prompt_prefix.clone();
-                let disp = Display{
-                    allow_tab: true,
-                    allow_newline: true,
-                    allow_escape: true,
-                };
-                let handle_invisible = true;
-
-                let styles = self.highlighter.as_ref().map(|h|
-                    h.highlight(&pfx)
-                ).unwrap_or_default();
-
-                self.draw_text_slice(0, &pfx, styles, disp, handle_invisible)?;
-                Ok(())
+                self.draw_raw_prompt(&pfx, Vec::new())
             }
         }
     }
@@ -241,23 +229,17 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
         match self.prompt_type {
             PromptType::Normal => {
                 let sfx = self.prompt_suffix.clone();
-                let disp = Display{
-                    allow_tab: true,
-                    allow_newline: true,
-                    allow_escape: true,
-                };
-                let handle_invisible = true;
 
                 let styles = self.highlighter.as_ref().map(|h|
                     h.highlight(&sfx)
                 ).unwrap_or_default();
 
-                self.draw_text_slice(0, &sfx, styles, disp, handle_invisible)?;
+                self.draw_raw_prompt(&sfx, styles)?;
             }
             PromptType::Number => {
                 let n = self.input_arg.to_i32();
                 let s = format!("(arg: {}) ", n);
-                self.draw_text_slice(0, &s, Vec::new(), Display::default(), false)?;
+                self.draw_text(0, &s)?;
             }
             PromptType::Search => {
                 let pre = match (self.reverse_search, self.search_failed) {
@@ -267,14 +249,56 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
                     (true,  true)  => "(failed reverse-i-search)",
                 };
 
-                let ent = self.get_history(self.history_index).to_owned();
-                let s = format!("{}`{}': {}", pre, self.search_buffer, ent);
+                let entry_str = self.get_history(self.history_index).to_owned();
+                let prefix_str = format!("{}`{}': ", pre, self.search_buffer);
+                let prefix_len = prefix_str.len();
 
-                self.draw_text_slice(0, &s, Vec::new(), Display::default(), false)?;
-                let pos = self.cursor;
+                // Calculate styles for the history entry part
+                let entry_styles = self.highlighter.as_ref()
+                    .map(|h| h.highlight(&entry_str))
+                    .unwrap_or_default();
 
-                let (lines, cols) = self.move_delta(ent.len(), pos, &ent);
-                return self.move_rel(lines, cols);
+                // Adjust style ranges to account for the prefix string
+                let adjusted_styles: Vec<(Range<usize>, Style)> = entry_styles.into_iter()
+                    .map(|(range, style)| (range.start + prefix_len .. range.end + prefix_len, style))
+                    .collect();
+
+                let full_str = format!("{}{}", prefix_str, entry_str);
+
+                // Draw the full string with adjusted styles using draw_text_impl
+                // Use Display options similar to draw_raw_prompt for consistency
+                self.draw_text_impl(0, &full_str, Display {
+                    allow_tab: true,
+                    allow_newline: true,
+                    allow_escape: true,
+                }, false, &adjusted_styles, 0)?;
+
+                // Calculate screen coordinates using start_col = 0 because full_str includes the prefix.
+                let (end_line, _end_col) = self.line_col_with(full_str.len(), &full_str, 0);
+                let target_cursor_pos_in_full_str = prefix_len + self.cursor;
+                let (target_line, target_col) = self.line_col_with(target_cursor_pos_in_full_str, &full_str, 0);
+
+                // Calculate relative movement directly
+                let lines = target_line as isize - end_line as isize;
+                // Calculate the column move: move to beginning of target line, then right by target_col.
+                // We know we ended at the beginning of the line *after* end_line (due to wrap or newline logic in draw_text_impl)
+                // or at _end_col if end_line == target_line and no wrap occurred.
+                // It's simpler to move to the beginning of the target line and then right.
+                let cols = target_col as isize; // We will move_up/down first, then move_to_first_column, then move_right.
+
+                // Apply movement
+                if lines > 0 {
+                    self.term.move_down(lines as usize)?;
+                } else if lines < 0 {
+                    self.term.move_up((-lines) as usize)?;
+                }
+                self.term.move_to_first_column()?;
+                if cols > 0 {
+                    self.term.move_right(cols as usize)?;
+                }
+                // We don't need to call self.move_rel as we performed the terminal moves directly.
+                // Also, don't update self.cursor here, it's already correct (index within history entry).
+                return Ok(())
             }
             PromptType::CompleteIntro(n) => {
                 return self.term.write(&complete_intro(n));
@@ -284,18 +308,9 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
             }
         }
 
-        // Draw buffer contents
         self.draw_buffer(0)?;
-
-        // Calculate the exact position where the cursor should be after drawing buffer
         let len = self.buffer.len();
-
-        // Force a move to explicitly position the cursor at the end of input
-        // instead of letting the terminal guess where it should be
-        self.move_to(len)?;
-
-        // Return success
-        Ok(())
+        self.move_from(len)
     }
 
     pub fn redraw_prompt(&mut self, new_prompt: PromptType) -> io::Result<()> {
@@ -307,160 +322,163 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
     /// Draws a portion of the buffer, starting from the given cursor position
     pub fn draw_buffer(&mut self, pos: usize) -> io::Result<()> {
         let (_, col) = self.line_col(pos);
-        let buf_to_draw = self.buffer[pos..].to_owned(); // Materialize the slice to draw
-        let disp = Display{ allow_tab: true, allow_newline: true, .. Display::default() };
-        let handle_invisible = false;
 
-        // If highlighter exists, calculate styles for the slice and draw using the function
-        let styles = if let Some(highlighter) = self.highlighter.as_ref() {
-            let full_styles = highlighter.highlight(&self.buffer); // Highlight full buffer
+        let styles = self.highlighter.as_ref().map(|h|
+            h.highlight(&self.buffer)
+        ).unwrap_or_default();
 
-            // Filter and adjust styles for the slice `pos..`
-            full_styles.into_iter()
-                .filter(|(range, _)| range.end > pos)
-                .filter_map(|(range, style)| {
-                    let slice_start = pos;
-                    let slice_end = self.buffer.len(); // Use full buffer length
-                    let overlap_start = range.start.max(slice_start);
-                    let overlap_end = range.end.min(slice_end);
-                    if overlap_start < overlap_end {
-                        let relative_start = overlap_start - slice_start;
-                        let relative_end = overlap_end - slice_start;
-                        Some((relative_start..relative_end, style))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>() // Collect adjusted styles
-        } else {
-            Vec::new() // No highlighter, empty styles
-        };
+        let buf_slice = self.buffer[pos..].to_owned();
 
-        self.draw_text_slice(col, &buf_to_draw, styles, disp, handle_invisible)?;
+        self.draw_text_impl(col, &buf_slice, Display{
+            allow_tab: true,
+            allow_newline: true,
+            .. Display::default()
+        }, false, &styles, pos)?;
 
         Ok(())
     }
 
-    fn draw_text_slice(
-        &mut self,
-        start_col: usize,
-        text: &str,
-        styles: Vec<(Range<usize>, Style)>,
-        disp: Display,
-        handle_invisible: bool,
-    ) -> io::Result<()> {
-        let mut current_style = Style::Default;
-        let mut style_iter = styles.into_iter().peekable();
+    /// Draw some text with the cursor beginning at the given column.
+    fn draw_text(&mut self, start_col: usize, text: &str) -> io::Result<()> {
+        self.draw_text_impl(start_col, text, Display{
+            allow_newline: true,
+            .. Display::default()
+        }, false, &[], 0)
+    }
 
-        let mut cur_col = start_col;
-        let mut text_pos = 0; // Position within text
+    fn draw_raw_prompt(&mut self, text: &str, styles: Vec<(Range<usize>, Style)>) -> io::Result<()> {
+        self.draw_text_impl(0, text, Display{
+            allow_tab: true,
+            allow_newline: true,
+            allow_escape: true,
+        }, true, &styles, 0)
+    }
+
+    fn draw_text_impl(&mut self, start_col: usize, text: &str, disp: Display,
+            handle_invisible: bool, styles: &[(Range<usize>, Style)], text_offset: usize) -> io::Result<()> {
         let width = self.screen_size.columns;
-        let mut in_invisible_section = false;
+        let mut col = start_col;
+        let mut out = String::with_capacity(text.len());
 
-        for chr in text.chars() {
-            let char_start_text_pos = text_pos;
-            text_pos += chr.len_utf8();
+        let mut current_style = &Style::Default;
+        let mut style_iter = styles.iter().peekable();
+        let mut current_text_byte = 0;
 
-            // Keep track of invisible sections (ANSI codes)
-            if handle_invisible {
-                if chr == START_INVISIBLE {
-                    in_invisible_section = true;
-                    self.term.write(chr.encode_utf8(&mut [0u8; 4]))?;
-                    continue;
-                } else if chr == END_INVISIBLE {
-                    in_invisible_section = false;
-                    self.term.write(chr.encode_utf8(&mut [0u8; 4]))?;
-                    continue;
-                }
+        let mut clear = false;
+        let mut hidden = false;
 
-                // Don't advance cursor position for invisible characters
-                if in_invisible_section {
-                    let mut char_buf = [0u8; 4];
-                    self.term.write(chr.encode_utf8(&mut char_buf))?;
-                    continue;
-                }
-            }
-
-            // Style lookup logic
-            let mut next_style = Style::Default;
-            while let Some((range, _)) = style_iter.peek() {
-                if char_start_text_pos >= range.end {
-                    style_iter.next();
-                } else if char_start_text_pos >= range.start {
-                    next_style = style_iter.peek().unwrap().1.clone();
-                    break;
-                } else {
-                    break;
-                }
-            }
-            // Apply style changes
-            if next_style != current_style {
-                match &next_style {
-                    Style::AnsiColor(code) => self.term.write(code)?,
-                    Style::Default => self.term.write("\x1b[0m")?,
-                }
-                current_style = next_style;
-            }
-
-            // Character drawing logic
-            let mut char_buf = [0u8; 4];
-            if chr == '\t' && disp.allow_tab {
-                let n = TAB_STOP - (cur_col % TAB_STOP);
-                let spaces = vec![b' '; n];
-                if cur_col + n > width {
-                    let pre = width - cur_col;
-                    self.term.write(str::from_utf8(&vec![b' '; pre]).unwrap_or(""))?;
-                    self.term.write(" \r")?;
-                    self.term.write(str::from_utf8(&vec![b' '; n - pre]).unwrap_or(""))?;
-                    cur_col = n - pre;
-                } else {
-                    self.term.write(str::from_utf8(&spaces).unwrap_or(""))?;
-                    cur_col += n;
-                    if cur_col == width {
-                         self.term.write(" \r")?;
-                         cur_col = 0;
+        for ch in text.chars() {
+            if handle_invisible && ch == START_INVISIBLE {
+                hidden = true;
+            } else if handle_invisible && ch == END_INVISIBLE {
+                hidden = false;
+            } else if hidden {
+                // Render the character, but assume it has 0 width.
+                out.push(ch);
+                current_text_byte += ch.len_utf8();
+            } else {
+                // Determine style for the current character
+                let absolute_byte_pos = text_offset + current_text_byte;
+                // Advance style iterator past ranges that end before the current position
+                while let Some((range, _)) = style_iter.peek() {
+                    if range.end <= absolute_byte_pos {
+                        style_iter.next();
+                    } else {
+                        break;
                     }
                 }
-            } else if chr == '\n' && disp.allow_newline {
-                self.term.write("\n")?;
-                self.term.move_to_first_column()?;
-                self.term.clear_to_screen_end()?;
-                cur_col = 0;
-            } else if is_combining_mark(chr) {
-                 self.term.write(chr.encode_utf8(&mut char_buf))?;
-            } else if is_wide(chr) {
-                 if cur_col >= width -1 {
-                     self.term.write("  \r")?;
-                     self.term.write(chr.encode_utf8(&mut char_buf))?;
-                     cur_col = 2;
-                 } else {
-                     self.term.write(chr.encode_utf8(&mut char_buf))?;
-                     cur_col += 2;
-                 }
-            } else if chr == ESCAPE && disp.allow_escape {
-                 self.term.write(chr.encode_utf8(&mut char_buf))?;
-                 cur_col += 1;
-            } else if is_ctrl(chr) {
-                 self.term.write("^")?;
-                 self.term.write(unctrl(chr).encode_utf8(&mut char_buf))?;
-                 cur_col += 2;
-            } else { // Regular printable char
-                 self.term.write(chr.encode_utf8(&mut char_buf))?;
-                 cur_col += 1;
-            }
 
-            if !is_wide(chr) && chr != '\t' && chr != '\n' && cur_col == width {
-                 self.term.write(" \r")?;
-                 cur_col = 0;
+                // Find the style that applies to the current position
+                let new_style = style_iter.peek()
+                    .filter(|(range, _)| range.start <= absolute_byte_pos)
+                    .map(|(_, style)| style)
+                    .unwrap_or(&Style::Default);
+
+                // Apply style change if needed
+                if new_style != current_style {
+                    if current_style != &Style::Default {
+                        out.push_str(RESET_STYLE); // Reset previous style
+                    }
+                    if let Style::AnsiColor(ansi_code) = new_style {
+                        out.push_str(ansi_code); // Apply new style
+                    }
+                    current_style = new_style;
+                }
+
+                // Apply style if changed
+                for ch in display(ch, disp) {
+                    if ch == '\t' {
+                        let n = TAB_STOP - (col % TAB_STOP);
+
+                        if col + n > width {
+                            let pre = width - col;
+                            out.extend(repeat(' ').take(pre));
+                            out.push_str(" \r");
+                            out.extend(repeat(' ').take(n - pre));
+                            col = n - pre;
+                        } else {
+                            out.extend(repeat(' ').take(n));
+                            col += n;
+
+                            if col == width {
+                                out.push_str(" \r");
+                                col = 0;
+                            }
+                        }
+                    } else if ch == '\n' {
+                        if !clear {
+                            self.term.write(&out)?;
+                            out.clear();
+                            self.term.clear_to_screen_end()?;
+                            clear = true;
+                        }
+
+                        out.push('\n');
+                        col = 0;
+                    } else if is_combining_mark(ch) {
+                        out.push(ch);
+                    } else if is_wide(ch) {
+                        if col == width - 1 {
+                            out.push_str("  \r");
+                            out.push(ch);
+                            col = 2;
+                        } else {
+                            out.push(ch);
+                            col += 2;
+                        }
+                    } else {
+                        out.push(ch);
+                        col += 1;
+
+                        if col == width {
+                            // Space pushes the cursor to the next line,
+                            // CR brings back to the start of the line.
+                            out.push_str(" \r");
+                            col = 0;
+                        }
+                    }
+                }
+                current_text_byte += ch.len_utf8(); // Advance byte counter *after* processing character
             }
         }
 
-        // Reset style at the end
-        if current_style != Style::Default {
-            self.term.write("\x1b[0m")?;
+        // Ensure style is reset at the end
+        if current_style != &Style::Default {
+             // Check if the last applied style was actually from the styles vec
+             let last_applied_style = styles.iter().rev().find(|(range, _)| range.start < text_offset + text.len());
+             match last_applied_style {
+                 Some((_, Style::Default)) => {}, // Already default
+                 Some((_, Style::AnsiColor(_))) => out.push_str(RESET_STYLE),
+                 None if !styles.is_empty() => out.push_str(RESET_STYLE), // Reset if styles were provided but didn't cover the end
+                 _ => {} // No styles or last was default
+             }
+         }
+
+        if col == width {
+            out.push_str(" \r");
         }
 
-        self.term.flush()
+        self.term.write(&out)
     }
 
     pub fn set_buffer(&mut self, buf: &str) -> io::Result<()> {
@@ -512,17 +530,27 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
 
     pub fn continue_history_search(&mut self, reverse: bool) -> io::Result<()> {
         if let Some(idx) = self.find_history_search(reverse) {
-            // Use the same logic as select_history_entry for redraw robustness.
-            self.move_to(0)?;
+            let original_cursor = self.cursor;
             self.set_history_entry(Some(idx));
-            self.new_buffer()?;
 
-            // After redrawing, move cursor to position after the original search prefix.
-            let prefix_len = self.search_buffer.len();
-            self.move_to(prefix_len)?;
+            // Clear the old line content visually
+            self.clear_prompt()?;
+            // Redraw the prompt and the entire new buffer content
+            self.draw_prompt_suffix()?;
+            // Move the cursor back to its original position
+            self.move_to(original_cursor)?; // This updates self.cursor and moves physical cursor
         }
-
         Ok(())
+    }
+
+    pub fn info(&self) -> String {
+        format!(
+            "buffer: {:?}, cursor: {} hindex: {:?} pmt_suffix_len: {} pmt_type: {:?} search_buffer: {:?} last_s: {:?} prompt_p: {:?} ({}) prompt_s: {:?} ({})",
+            self.buffer, self.cursor, self.history_index,
+            self.prompt_suffix_len, self.prompt_type, self.search_buffer,
+            self.last_search, self.prompt_prefix, self.prompt_prefix_len,
+            self.prompt_suffix, self.prompt_suffix_len,
+        )
     }
 
     fn find_history_search(&self, reverse: bool) -> Option<usize> {
@@ -588,6 +616,7 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
         } else {
             self.search_failed = true;
         }
+
 
         self.prompt_type = PromptType::Search;
         self.draw_prompt_suffix()
@@ -845,139 +874,61 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
     pub fn delete_range<R: RangeArgument<usize>>(&mut self, range: R) -> io::Result<()> {
         let start = range.start().cloned().unwrap_or(0);
         let end = range.end().cloned().unwrap_or_else(|| self.buffer.len());
-        let old_cursor_pos = self.cursor; // Store cursor position *before* moving/deleting
 
-        // Validate range is within buffer bounds and logical
-        if start > end || end > self.buffer.len() {
-            // Handle invalid range gracefully, maybe log or return error? For now, do nothing.
-            return Ok(());
-        }
+        // Move to the start of the deletion range
+        self.move_to(start)?;
 
-        // --- Calculate old screen position BEFORE modifying buffer ---
-        // Clone buffer *before* drain to calculate the old position accurately.
-        // Using the buffer state that corresponds to old_cursor_pos.
-        let old_buffer_for_calc = self.buffer.clone();
-        let prompt_len = self.prompt_suffix_length(); // Calculate once
-        let (old_line, old_col) = self.line_col_with(old_cursor_pos, &old_buffer_for_calc, prompt_len);
-
-        // --- Modify buffer ---
-        // Drain the specified range from the buffer
+        // Remove the characters in the range
         let _ = self.buffer.drain(start..end);
-        let new_cursor_pos = start; // Cursor logically moves to the start of the deleted range
 
-        // Determine the position from where we need to start redrawing.
-        // Find the start of the word containing the deletion point (`start`).
-        let mut redraw_start_pos = 0;
-        if new_cursor_pos > 0 {
-            // Search backwards from the new cursor position in the modified buffer
-            if let Some(ws_pos) = self.buffer[..new_cursor_pos].rfind(char::is_whitespace) {
-                 // Found whitespace, redraw starts after it.
-                 redraw_start_pos = ws_pos + self.buffer[ws_pos..].chars().next().map_or(0, |c| c.len_utf8());
-            } // else redraw_start_pos remains 0 (start of the line)
-        }
+        // Move physical cursor to the beginning of the editable area
+        let current_internal_cursor = self.cursor; // Save internal cursor state
+        self.move_to(0)?; // Move physical cursor to start of input area
+        self.cursor = current_internal_cursor; // Restore internal cursor state
 
-        // --- Calculate new screen position AFTER modifying buffer ---
-        // Use the current buffer state corresponding to redraw_start_pos.
-        let (redraw_line, redraw_col) = self.line_col_with(redraw_start_pos, &self.buffer, prompt_len);
+        // Redraw the entire buffer from position 0 with updated highlighting
+        self.draw_buffer(0)?;
 
-        // --- Redrawing Logic ---
-        // 1. Move the physical terminal cursor using relative movement
-        //    Calculate delta between the old screen pos and the new redraw start screen pos.
-        let lines_delta = redraw_line as isize - old_line as isize;
-        let cols_delta = redraw_col as isize - old_col as isize;
-        self.move_rel(lines_delta, cols_delta)?;
+        // Clear any leftover characters from the previous render
+        self.term.clear_to_screen_end()?;
 
-        // 2. Redraw the buffer content starting from redraw_start_pos
-        self.draw_buffer(redraw_start_pos)?;
+        // Update internal cursor state to the deletion point
+        self.cursor = start;
 
-        // 3. Clear the rest of the screen from the end of the newly drawn buffer content
-        self.clear_to_screen_end()?;
-
-        // 4. Update the logical cursor position *after* drawing
-        self.cursor = new_cursor_pos;
-
-        // 5. Move the physical terminal cursor from the *end* of the drawn buffer content
-        //    to the new logical cursor position, using the existing helper.
-        self.move_from(self.buffer.len())?; // Moves cursor from end of line to self.cursor
+        // Move physical cursor from the end of the drawn buffer back to deletion point
+        let len = self.buffer.len();
+        self.move_from(len)?;
 
         Ok(())
     }
 
     pub fn insert_str(&mut self, s: &str) -> io::Result<()> {
-        let insertion_cursor = self.cursor;
-        self.buffer.insert_str(insertion_cursor, s);
-        let new_cursor_pos = insertion_cursor + s.len();
+        let original_cursor = self.cursor;
+        self.buffer.insert_str(original_cursor, s);
+        let new_cursor = original_cursor + s.len();
 
-        // Determine the position from where we need to start redrawing
-        // We need to be smarter about finding the start of the current word
-        let redraw_start_pos = if insertion_cursor == 0 {
-            // If we're at the start of the buffer, redraw everything
-            0
-        } else {
-            // Start with the assumption that we redraw from the insertion point
-            let mut pos = insertion_cursor;
+        // Move physical cursor to the beginning of the editable area (position 0 relative to prompt suffix)
+        // Need to use move_rel carefully or move_to(0) which recalculates absolute position.
+        // Let's recalculate using move_to(0).
+        let current_internal_cursor = self.cursor; // Save internal cursor state before move_to potentially changes it
+        self.move_to(0)?; // Move physical cursor to the start of the input area
+        self.cursor = current_internal_cursor; // Restore internal cursor state
 
-            // Find the first non-whitespace character before the insertion point
-            // This handles leading whitespace better
-            let before_insertion = &self.buffer[..insertion_cursor];
+        // Redraw the entire buffer from position 0 with updated highlighting
+        self.draw_buffer(0)?; // This draws the text and leaves the physical cursor at the end
 
-            // Check if there's any non-whitespace before the cursor
-            if before_insertion.trim_start().is_empty() {
-                // Only whitespace before cursor, start redraw from beginning
-                0
-            } else {
-                // There's at least one non-whitespace char before cursor
-                // Find the start of the current word by going back until whitespace
-                let mut has_found_nonws = false;
 
-                for (i, c) in before_insertion.char_indices().rev() {
-                    if !has_found_nonws && !c.is_whitespace() {
-                        // Found a non-whitespace character
-                        has_found_nonws = true;
-                    } else if has_found_nonws && c.is_whitespace() {
-                        // Found the boundary between whitespace and word
-                        // Start redrawing after this whitespace
-                        pos = i + c.len_utf8();
-                        break;
-                    }
-                }
+        // Clear any leftover characters from the previous render (if the line got shorter)
+        // Although in insert_str it only gets longer or stays same. Still good practice.
+        self.term.clear_to_screen_end()?;
 
-                // If we examined all chars without finding a word boundary,
-                // we're in the first word, so start from the beginning or after leading whitespace
-                if !has_found_nonws || pos == insertion_cursor {
-                    // Find the start of the first word (after any leading whitespace)
-                    let mut start = 0;
-                    for (i, c) in self.buffer.char_indices() {
-                        if !c.is_whitespace() {
-                            break;
-                        }
-                        start = i + c.len_utf8();
-                    }
-                    pos = start;
-                }
+        // Update the internal cursor state to the correct position after insertion
+        self.cursor = new_cursor;
 
-                pos
-            }
-        };
-
-        // Log for debugging
-        // println!("Redraw from pos {} in buffer {:?}", redraw_start_pos, self.buffer);
-
-        // --- Redrawing Logic ---
-        // 1. Move the physical terminal cursor to the screen position of redraw_start_pos
-        let (lines, cols) = self.move_delta(insertion_cursor, redraw_start_pos, &self.buffer);
-        self.move_rel(lines, cols)?;
-
-        // 2. Redraw the buffer content starting from redraw_start_pos
-        self.draw_buffer(redraw_start_pos)?;
-
-        // 3. Update the logical cursor position *after* drawing
-        self.cursor = new_cursor_pos;
-
-        // 4. Move the physical terminal cursor from the *end* of the drawn buffer
-        //    to the new logical cursor position.
+        // Move the physical cursor from the end of the drawn buffer
+        // back to the correct internal cursor position.
         let len = self.buffer.len();
-        self.move_from(len)?; // This calculates delta from len to self.cursor (new_cursor_pos)
+        self.move_from(len)?;
 
         Ok(())
     }
@@ -1064,23 +1015,9 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
             return (0, 0);
         }
 
-        // First calculate the display size of the buffer content
-        let content_display_width = self.display_size(&buf[..pos], 0);
+        let n = start_col + self.display_size(&buf[..pos], start_col);
 
-        // Then calculate the total displayed columns including the prompt
-        let total_display_width = start_col + content_display_width;
-
-        if width > 0 {
-            // For exact line endings, ensure cursor goes to next line's beginning
-            if total_display_width > 0 && total_display_width % width == 0 {
-                (total_display_width / width, 0)
-            } else {
-                (total_display_width / width, total_display_width % width)
-            }
-        } else {
-            // Avoid division by zero
-            (0, total_display_width)
-        }
+        (n / width, n % width)
     }
 
     pub fn clear_screen(&mut self) -> io::Result<()> {
@@ -1122,10 +1059,6 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
 
     /// Move back to true cursor position from some other position
     pub fn move_from(&mut self, pos: usize) -> io::Result<()> {
-        if pos == self.cursor {
-            return Ok(());  // Already at the right position
-        }
-
         let (lines, cols) = self.move_delta(pos, self.cursor, &self.buffer);
         self.move_rel(lines, cols)
     }
@@ -1152,20 +1085,12 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
     /// Moves from `old` to `new` cursor position, using the given buffer
     /// as current input.
     fn move_delta(&self, old: usize, new: usize, buf: &str) -> (isize, isize) {
-        // Calculate the position for both old and new cursor positions
         let prompt_len = self.prompt_suffix_length();
-
-        // Get screen coordinates for the old cursor position
         let (old_line, old_col) = self.line_col_with(old, buf, prompt_len);
-
-        // Get screen coordinates for the new cursor position
         let (new_line, new_col) = self.line_col_with(new, buf, prompt_len);
 
-        // Calculate the difference in lines and columns
-        let line_diff = new_line as isize - old_line as isize;
-        let col_diff = new_col as isize - old_col as isize;
-
-        (line_diff, col_diff)
+        (new_line as isize - old_line as isize,
+         new_col as isize - old_col as isize)
     }
 
     fn move_rel(&mut self, lines: isize, cols: isize) -> io::Result<()> {
@@ -1200,7 +1125,7 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Blink {
     pos: usize,
     expiry: Instant,
@@ -1372,75 +1297,42 @@ impl Write {
         self.prompt_prefix = pre.to_owned();
         self.prompt_suffix = suf.to_owned();
 
-        // Extract visible text by filtering out invisible sequences
         let pre_virt = filter_visible(pre);
-
-        // Calculate the correct display size of the filtered prompt prefix
         self.prompt_prefix_len = self.display_size(&pre_virt, 0);
 
-        // Extract visible text by filtering out invisible sequences
         let suf_virt = filter_visible(suf);
-
-        // Calculate the correct display size of the filtered prompt suffix
         self.prompt_suffix_len = self.display_size(&suf_virt, 0);
     }
 
     pub fn display_size(&self, s: &str, start_col: usize) -> usize {
         let width = self.screen_size.columns;
-        if width == 0 {
-            // Avoid division by zero and other issues with zero width
-            return s.chars().filter(|&ch| ch != START_INVISIBLE && ch != END_INVISIBLE).count();
-        }
-
         let mut col = start_col;
-        let mut in_invisible_section = false;
 
-        // Use this display config for visual width calculation
         let disp = Display{
             allow_tab: true,
             allow_newline: true,
             .. Display::default()
         };
 
-        // Process each character in the string
-        for ch in s.chars() {
-            // Handle invisible section markers
-            if ch == START_INVISIBLE {
-                in_invisible_section = true;
-                continue;
-            } else if ch == END_INVISIBLE {
-                in_invisible_section = false;
-                continue;
-            }
-
-            // Skip width calculation for characters inside invisible sections
-            if in_invisible_section {
-                continue;
-            }
-
-            // Process visible characters for width calculation
-            for display_ch in display(ch, disp) {
-                let n = match display_ch {
-                    '\n' => width - (col % width),
-                    '\t' => TAB_STOP - (col % TAB_STOP),
-                    ch if is_combining_mark(ch) => 0,
-                    ch if is_wide(ch) => {
-                        if col % width == width - 1 {
-                            // Can't render a fullwidth character into last column
-                            // When we reach the end of a line, it wraps to the next line
-                            3
-                        } else {
-                            2
-                        }
+        for ch in filter_visible(s).chars().flat_map(|ch| display(ch, disp)) {
+            let n = match ch {
+                '\n' => width - (col % width),
+                '\t' => TAB_STOP - (col % TAB_STOP),
+                ch if is_combining_mark(ch) => 0,
+                ch if is_wide(ch) => {
+                    if col % width == width - 1 {
+                        // Can't render a fullwidth character into last column
+                        3
+                    } else {
+                        2
                     }
-                    _ => 1
-                };
+                }
+                _ => 1
+            };
 
-                col += n;
-            }
+            col += n;
         }
 
-        // Return the calculated width
         col - start_col
     }
 }
