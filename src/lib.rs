@@ -52,7 +52,7 @@ pub mod prompter;
 pub mod reader;
 pub mod table;
 pub mod terminal;
-mod util;
+pub mod util;
 pub mod variables;
 pub mod writer;
 

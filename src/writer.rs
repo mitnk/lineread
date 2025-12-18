@@ -19,8 +19,9 @@ use crate::reader::{START_INVISIBLE, END_INVISIBLE};
 use crate::terminal::{CursorMode, Size, Terminal, TerminalWriter};
 use crate::util::{
     backward_char, forward_char, backward_search_char, forward_search_char,
-    filter_visible, is_combining_mark, is_wide, RangeArgument,
+    grapheme_width, filter_visible, RangeArgument,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Duration to wait for input when "blinking"
 pub(crate) const BLINK_DURATION: Duration = Duration::from_millis(500);
@@ -367,99 +368,139 @@ impl<'a, Term: Terminal> WriteLock<'a, Term> {
         let mut clear = false;
         let mut hidden = false;
 
-        for ch in text.chars() {
-            if handle_invisible && ch == START_INVISIBLE {
-                hidden = true;
-            } else if handle_invisible && ch == END_INVISIBLE {
-                hidden = false;
-            } else if hidden {
-                // Render the character, but assume it has 0 width.
-                out.push(ch);
-                current_text_byte += ch.len_utf8();
-            } else {
-                // Determine style for the current character
-                let absolute_byte_pos = text_offset + current_text_byte;
-                // Advance style iterator past ranges that end before the current position
-                while let Some((range, _)) = style_iter.peek() {
-                    if range.end <= absolute_byte_pos {
-                        style_iter.next();
-                    } else {
-                        break;
-                    }
+        // Use grapheme clusters for proper emoji handling
+        for grapheme in text.graphemes(true) {
+            // Handle invisible sequences (check first char of grapheme)
+            if handle_invisible && grapheme.len() == 1 {
+                let ch = grapheme.chars().next().unwrap();
+                if ch == START_INVISIBLE {
+                    hidden = true;
+                    current_text_byte += grapheme.len();
+                    continue;
+                } else if ch == END_INVISIBLE {
+                    hidden = false;
+                    current_text_byte += grapheme.len();
+                    continue;
                 }
+            }
 
-                // Find the style that applies to the current position
-                let new_style = style_iter.peek()
-                    .filter(|(range, _)| range.start <= absolute_byte_pos)
-                    .map(|(_, style)| style)
-                    .unwrap_or(&Style::Default);
+            if hidden {
+                // Render the grapheme, but assume it has 0 width.
+                out.push_str(grapheme);
+                current_text_byte += grapheme.len();
+                continue;
+            }
 
-                // Apply style change if needed
-                if new_style != current_style {
-                    if current_style != &Style::Default {
-                        out.push_str(RESET_STYLE); // Reset previous style
-                    }
-                    if let Style::AnsiColor(ansi_code) = new_style {
-                        out.push_str(ansi_code); // Apply new style
-                    }
-                    current_style = new_style;
+            // Determine style for the current grapheme
+            let absolute_byte_pos = text_offset + current_text_byte;
+            // Advance style iterator past ranges that end before the current position
+            while let Some((range, _)) = style_iter.peek() {
+                if range.end <= absolute_byte_pos {
+                    style_iter.next();
+                } else {
+                    break;
                 }
+            }
 
-                // Apply style if changed
-                for ch in display(ch, disp) {
-                    if ch == '\t' {
-                        let n = TAB_STOP - (col % TAB_STOP);
+            // Find the style that applies to the current position
+            let new_style = style_iter.peek()
+                .filter(|(range, _)| range.start <= absolute_byte_pos)
+                .map(|(_, style)| style)
+                .unwrap_or(&Style::Default);
 
-                        if col + n > width {
-                            let pre = width - col;
-                            out.extend(repeat(' ').take(pre));
-                            out.push_str(" \r");
-                            out.extend(repeat(' ').take(n - pre));
-                            col = n - pre;
-                        } else {
-                            out.extend(repeat(' ').take(n));
-                            col += n;
+            // Apply style change if needed
+            if new_style != current_style {
+                if current_style != &Style::Default {
+                    out.push_str(RESET_STYLE); // Reset previous style
+                }
+                if let Style::AnsiColor(ansi_code) = new_style {
+                    out.push_str(ansi_code); // Apply new style
+                }
+                current_style = new_style;
+            }
 
-                            if col == width {
-                                out.push_str(" \r");
-                                col = 0;
-                            }
-                        }
-                    } else if ch == '\n' {
-                        if !clear {
-                            self.term.write(&out)?;
-                            out.clear();
-                            self.term.clear_to_screen_end()?;
-                            clear = true;
-                        }
+            // Handle single-character graphemes specially (tabs, newlines, control chars)
+            if grapheme.len() == 1 {
+                let ch = grapheme.chars().next().unwrap();
 
-                        out.push('\n');
-                        col = 0;
-                    } else if is_combining_mark(ch) {
-                        out.push(ch);
-                    } else if is_wide(ch) {
-                        if col == width - 1 {
-                            out.push_str("  \r");
-                            out.push(ch);
-                            col = 2;
-                        } else {
-                            out.push(ch);
-                            col += 2;
-                        }
+                // Handle tab
+                if ch == '\t' && disp.allow_tab {
+                    let n = TAB_STOP - (col % TAB_STOP);
+                    if col + n > width {
+                        let pre = width - col;
+                        out.extend(repeat(' ').take(pre));
+                        out.push_str(" \r");
+                        out.extend(repeat(' ').take(n - pre));
+                        col = n - pre;
                     } else {
-                        out.push(ch);
-                        col += 1;
-
+                        out.extend(repeat(' ').take(n));
+                        col += n;
                         if col == width {
-                            // Space pushes the cursor to the next line,
-                            // CR brings back to the start of the line.
                             out.push_str(" \r");
                             col = 0;
                         }
                     }
+                    current_text_byte += grapheme.len();
+                    continue;
                 }
-                current_text_byte += ch.len_utf8(); // Advance byte counter *after* processing character
+
+                // Handle newline
+                if ch == '\n' && disp.allow_newline {
+                    if !clear {
+                        self.term.write(&out)?;
+                        out.clear();
+                        self.term.clear_to_screen_end()?;
+                        clear = true;
+                    }
+                    out.push('\n');
+                    col = 0;
+                    current_text_byte += grapheme.len();
+                    continue;
+                }
+
+                // Handle control characters (display as ^X)
+                if is_ctrl(ch) && ch != ESCAPE {
+                    for disp_ch in display(ch, disp) {
+                        out.push(disp_ch);
+                        col += 1;
+                        if col == width {
+                            out.push_str(" \r");
+                            col = 0;
+                        }
+                    }
+                    current_text_byte += grapheme.len();
+                    continue;
+                }
+
+                // Handle escape character
+                if ch == ESCAPE && disp.allow_escape {
+                    out.push(ch);
+                    current_text_byte += grapheme.len();
+                    continue;
+                }
             }
+
+            // For all other graphemes (including complex emoji), use grapheme width
+            let gw = grapheme_width(grapheme);
+
+            if gw == 0 {
+                // Zero-width grapheme, just output it
+                out.push_str(grapheme);
+            } else if gw >= 2 && col == width - 1 {
+                // Wide grapheme at end of line - wrap first
+                out.push_str("  \r");
+                out.push_str(grapheme);
+                col = gw;
+            } else {
+                out.push_str(grapheme);
+                col += gw;
+                if col >= width {
+                    out.push_str(" \r");
+                    col = col % width;
+                }
+            }
+
+            current_text_byte += grapheme.len();
         }
 
         // Ensure style is reset at the end
@@ -1308,29 +1349,40 @@ impl Write {
         let width = self.screen_size.columns;
         let mut col = start_col;
 
-        let disp = Display{
-            allow_tab: true,
-            allow_newline: true,
-            .. Display::default()
-        };
+        let visible = filter_visible(s);
 
-        for ch in filter_visible(s).chars().flat_map(|ch| display(ch, disp)) {
-            let n = match ch {
-                '\n' => width - (col % width),
-                '\t' => TAB_STOP - (col % TAB_STOP),
-                ch if is_combining_mark(ch) => 0,
-                ch if is_wide(ch) => {
-                    if col % width == width - 1 {
-                        // Can't render a fullwidth character into last column
-                        3
-                    } else {
-                        2
-                    }
+        // Use grapheme clusters for proper emoji handling
+        for grapheme in visible.graphemes(true) {
+            // Handle special characters first
+            if grapheme == "\n" {
+                col += width - (col % width);
+                continue;
+            }
+            if grapheme == "\t" {
+                col += TAB_STOP - (col % TAB_STOP);
+                continue;
+            }
+
+            // For control characters, use the display function
+            if grapheme.len() == 1 {
+                let ch = grapheme.chars().next().unwrap();
+                if is_ctrl(ch) {
+                    // Control chars display as ^X (2 chars)
+                    col += 2;
+                    continue;
                 }
-                _ => 1
-            };
+            }
 
-            col += n;
+            // Get the display width of the grapheme cluster
+            let gw = grapheme_width(grapheme);
+
+            // Handle wide characters at line boundary
+            if gw == 2 && col % width == width - 1 {
+                // Can't render a fullwidth character into last column
+                col += 3;
+            } else {
+                col += gw;
+            }
         }
 
         col - start_col

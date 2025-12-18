@@ -1,9 +1,17 @@
-//! Provides miscellaneous utilities
+//! Provides miscellaneous utilities for string manipulation and grapheme handling.
+//!
+//! This module includes functions for working with Unicode grapheme clusters,
+//! which are essential for proper handling of complex characters like emoji sequences.
+
+#![allow(missing_docs)]
 
 use std::borrow::Cow;
 use std::io;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::str::{from_utf8, from_utf8_unchecked};
+
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub fn filter_visible(s: &str) -> Cow<str> {
     use crate::reader::{START_INVISIBLE, END_INVISIBLE};
@@ -90,13 +98,16 @@ impl<T> RangeArgument<T> for RangeTo<T> {
 
 impl<T> RangeArgument<T> for RangeFull {}
 
+/// Move backward by `n` graphemes from position `cur` in string `s`.
+/// Returns the new byte position.
 pub fn backward_char(n: usize, s: &str, cur: usize) -> usize {
-    let mut chars = s[..cur].char_indices()
-        .filter(|&(_, ch)| !is_combining_mark(ch));
-    let mut res = cur;
+    let mut graphemes: Vec<(usize, &str)> = s[..cur]
+        .grapheme_indices(true)
+        .collect();
 
+    let mut res = cur;
     for _ in 0..n {
-        match chars.next_back() {
+        match graphemes.pop() {
             Some((idx, _)) => res = idx,
             None => return 0
         }
@@ -105,18 +116,19 @@ pub fn backward_char(n: usize, s: &str, cur: usize) -> usize {
     res
 }
 
+/// Move forward by `n` graphemes from position `cur` in string `s`.
+/// Returns the new byte position.
 pub fn forward_char(n: usize, s: &str, cur: usize) -> usize {
-    let mut chars = s[cur..].char_indices()
-        .filter(|&(_, ch)| !is_combining_mark(ch));
+    let mut graphemes = s[cur..].grapheme_indices(true);
 
     for _ in 0..n {
-        match chars.next() {
+        match graphemes.next() {
             Some(_) => (),
             None => return s.len()
         }
     }
 
-    match chars.next() {
+    match graphemes.next() {
         Some((idx, _)) => cur + idx,
         None => s.len()
     }
@@ -341,22 +353,37 @@ pub fn find_matching_paren(s: &str, quotes: &str, open: char, close: char) -> Op
     None
 }
 
-pub fn is_combining_mark(ch: char) -> bool {
-    use mortal::util::is_combining_mark;
-
-    is_combining_mark(ch)
-}
-
-pub fn is_wide(ch: char) -> bool {
-    use mortal::util::char_width;
-
-    char_width(ch) == Some(2)
-}
-
 pub fn match_name(name: &str, value: &str) -> bool {
     // A value of "foo" matches both "foo" and "foo-bar"
     name == value ||
         (name.starts_with(value) && name.as_bytes()[value.len()] == b'-')
+}
+
+/// Returns the display width of a grapheme cluster.
+/// This correctly handles complex emoji sequences like "👩‍🚒" as a single unit.
+pub fn grapheme_width(grapheme: &str) -> usize {
+    // For emoji sequences joined by ZWJ (zero-width joiner), the visual width
+    // is typically 2 (one emoji cell), not the sum of all component widths.
+    // We use unicode-width which handles most cases correctly.
+    let width = UnicodeWidthStr::width(grapheme);
+
+    // Ensure minimum width of 1 for non-empty graphemes that report 0 width
+    // (e.g., some control characters or unusual Unicode)
+    if width == 0 && !grapheme.is_empty() {
+        // Check if it's entirely composed of zero-width characters
+        let has_visible = grapheme.chars().any(|ch| {
+            use unicode_width::UnicodeWidthChar;
+            ch.width().unwrap_or(0) > 0
+        });
+        if has_visible {
+            // Has visible characters but width reported as 0, use 1 as minimum
+            1
+        } else {
+            0
+        }
+    } else {
+        width
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +391,9 @@ mod test {
     use super::{
         longest_common_prefix,
         match_name,
+        grapheme_width,
+        backward_char,
+        forward_char,
     };
 
     #[test]
@@ -397,5 +427,81 @@ mod test {
         assert!(!match_name("foo", "bar"));
         assert!(!match_name("foo", "foo-"));
         assert!(!match_name("foo", "foo-bar"));
+    }
+
+    #[test]
+    fn test_grapheme_width() {
+        // Test 1: "é" as e + combining acute accent (2 bytes: 'e' + '\u{301}')
+        // This is a combining character sequence - visually displays as 1 character width
+        let e_acute = "e\u{301}";
+        assert_eq!(grapheme_width(e_acute), 1);
+
+        // Test 2: "🚒" (fire engine emoji) - single emoji, width 2
+        let fire_engine = "🚒";
+        assert_eq!(grapheme_width(fire_engine), 2);
+
+        // Test 3: "👩‍🚒" (woman firefighter - ZWJ sequence: 👩 + ZWJ + 🚒)
+        // This is a ZWJ emoji sequence that displays as a single emoji
+        let woman_firefighter = "👩\u{200d}🚒";
+        // ZWJ sequences should display as a single emoji with width 2
+        assert_eq!(grapheme_width(woman_firefighter), 2);
+    }
+
+    #[test]
+    fn test_char_navigation_ascii() {
+        // Verify ASCII strings work correctly (each char = 1 grapheme)
+        let ascii = "hello";
+
+        // Forward navigation
+        assert_eq!(forward_char(1, ascii, 0), 1);  // h -> e
+        assert_eq!(forward_char(2, ascii, 0), 2);  // h -> l
+        assert_eq!(forward_char(5, ascii, 0), 5);  // to end
+        assert_eq!(forward_char(10, ascii, 0), 5); // past end -> clamp to end
+
+        // Backward navigation
+        assert_eq!(backward_char(1, ascii, 5), 4); // end -> o
+        assert_eq!(backward_char(2, ascii, 5), 3); // end -> l
+        assert_eq!(backward_char(5, ascii, 5), 0); // to start
+        assert_eq!(backward_char(10, ascii, 5), 0); // past start -> clamp to 0
+    }
+
+    #[test]
+    fn test_char_navigation_with_graphemes() {
+        // Test string with all three grapheme types: "é🚒👩‍🚒"
+        let test_str = "e\u{301}🚒👩\u{200d}🚒";
+
+        // Verify byte positions:
+        // - "e\u{301}" = 3 bytes (e=1 + combining=2)
+        // - "🚒" = 4 bytes
+        // - "👩\u{200d}🚒" = 11 bytes (👩=4 + ZWJ=3 + 🚒=4)
+        // Total = 18 bytes
+        assert_eq!(test_str.len(), 18);
+
+        // Test forward_char: move forward by 1 grapheme at a time
+        let pos0 = 0;
+        let pos1 = forward_char(1, test_str, pos0); // After "é"
+        assert_eq!(pos1, 3);
+
+        let pos2 = forward_char(1, test_str, pos1); // After "🚒"
+        assert_eq!(pos2, 7);
+
+        let pos3 = forward_char(1, test_str, pos2); // After "👩‍🚒"
+        assert_eq!(pos3, 18); // End of string
+
+        // Test backward_char: move backward by 1 grapheme at a time
+        let back1 = backward_char(1, test_str, 18); // Before "👩‍🚒"
+        assert_eq!(back1, 7);
+
+        let back2 = backward_char(1, test_str, back1); // Before "🚒"
+        assert_eq!(back2, 3);
+
+        let back3 = backward_char(1, test_str, back2); // Before "é"
+        assert_eq!(back3, 0);
+
+        // Test moving multiple graphemes at once
+        assert_eq!(forward_char(2, test_str, 0), 7);
+        assert_eq!(forward_char(3, test_str, 0), 18);
+        assert_eq!(backward_char(2, test_str, 18), 3);
+        assert_eq!(backward_char(3, test_str, 18), 0);
     }
 }
